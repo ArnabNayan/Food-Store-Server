@@ -31,7 +31,8 @@ async function run() {
     const foodsDatabaseCollection=client.db("foodDb").collection("foodsDatabase")
     const cartCollection = client.db("foodDb").collection("carts")
     const userCollection = client.db("foodDb").collection("users")
-   
+    const paymentCollection = client.db("foodDb").collection("payments")
+   const reviewCollection = client.db("foodDb").collection("reviews")
     //middlewire
     const verifyToken=(req,res,next)=>{
       // console.log('inside verify token',req.headers)
@@ -189,6 +190,255 @@ async function run() {
         clientSecret: paymentIntent.client_secret,
       });
     })
+    app.get('/payments/:email',verifyToken,async(req,res)=>{
+      const query = {email:req.params.email}
+      if(req.params.email !== req.decoded.email){
+        return res.status(403).send({message:'forbidden access'});
+      }
+      const result = await paymentCollection.find(query).toArray();
+      res.send(result);
+    })
+    app.get('/payments',async(req,res)=>{
+  const result=await paymentCollection.find().toArray();
+  res.send(result)
+})
+
+    app.post('/payments',async(req,res)=>{
+      const payment=req.body;
+      const paymentResult = await paymentCollection.insertOne(payment)
+      console.log('payment info',payment)
+      const query={_id:{
+        $in: payment.cartIds.map(id=>new ObjectId(id))
+      }}
+      const deleteResult = await cartCollection.deleteMany(query)
+      res.send({paymentResult,deleteResult})
+    })
+
+    app.patch('/payments/status/:id', verifyToken, verifyAdmin, async (req, res) => {
+    const id = req.params.id;
+    const updatedStatus = req.body.status;
+    const filter = { _id: new ObjectId(id) };
+    const updateDoc = {
+        $set: {
+            status: updatedStatus
+        }
+    };
+    const result = await paymentCollection.updateOne(filter, updateDoc);
+    res.send(result);
+});
+
+
+    //stats or analytics
+    app.get('/admin-stats',verifyToken,verifyAdmin,async(req,res)=>{
+       const users = await userCollection.estimatedDocumentCount();
+       const foodItems = await foodsDatabaseCollection.estimatedDocumentCount()
+       const totalOrders = await paymentCollection.estimatedDocumentCount() 
+       const result = await paymentCollection.aggregate([
+        {
+          $group:{
+            _id:null,
+            totalRevenue:{
+              $sum:'$price'
+            }
+          }
+        }
+       ]).toArray()
+       const revenue = result.length>0?result[0].totalRevenue:0;
+       res.send({
+        users,
+        foodItems,
+        totalOrders,
+        revenue
+       })
+    })
+
+    //user-stats
+    app.get('/user-stats/:email', async (req, res) => {
+      const email = req.params.email;
+    
+      try {
+        // Total items currently in the cart by the user
+        const totalCartItemsResult = await cartCollection.aggregate([
+          { $match: { email } },
+          { $group: { _id: null, totalItems: { $sum: { $size: "$foodItemIds" } } } }
+        ]).toArray();
+    
+        const cartItems = totalCartItemsResult.length > 0 ? totalCartItemsResult[0].totalItems : 0;
+    
+        // Total number of items the user has paid for
+        const totalPaidItemsResult = await paymentCollection.aggregate([
+          { $match: { email } },
+          { $group: { _id: null, totalPaidItems: { $sum: { $size: "$foodItemIds" } } } }
+        ]).toArray();
+    
+        const foodItems = totalPaidItemsResult.length > 0 ? totalPaidItemsResult[0].totalPaidItems : 0;
+    
+        // Calculate total revenue for the user
+        const revenueResult = await paymentCollection.aggregate([
+          { $match: { email } },
+          { $group: { _id: null, totalRevenue: { $sum: '$price' } } }
+        ]).toArray();
+    
+        const revenue = revenueResult.length > 0 ? revenueResult[0].totalRevenue : 0;
+    
+        // Total number of orders by the user
+        const totalOrders = await paymentCollection.countDocuments({ email });
+    
+        res.send({
+          cartItems,
+          foodItems,
+          totalOrders,
+          revenue
+        });
+      } catch (error) {
+        console.error('Error fetching user stats:', error);
+        res.status(500).send({ message: 'Error fetching user stats' });
+      }
+    });
+    
+    
+//order-stats
+app.get('/order-stats',verifyToken,verifyAdmin,async(req,res)=>{
+  const result = await paymentCollection.aggregate([
+    {
+      $unwind:'$foodItemIds'
+    },
+    {
+      $set:{
+        foodItemIds:{
+          $toObjectId:'$foodItemIds'
+        }
+      }
+    },
+    {
+      $lookup:{
+        from:'foodsDatabase',
+        localField:'foodItemIds',
+        foreignField:'_id',
+        as:'foodItems'
+      }
+    },
+    {
+      $unwind:'$foodItems'
+    },
+    {
+      $set:{
+        'foodItems.price':{
+          $convert:{
+            input:'$foodItems.price',
+             to:'int',
+             onError:0,
+             onNull:0
+
+          }
+        }
+      }
+    },
+    {
+      $group:{
+        _id:'$foodItems.category',
+         quantity:{$sum:1},
+         revenue:{$sum: '$foodItems.price'}
+      }
+    },
+    {
+     $project:{
+       _id:0,
+        category:'$_id',
+        quantity:'$quantity',
+        revenue:'$revenue'
+  }
+}
+
+  ]).toArray()
+  res.send(result)
+})
+app.get('/order-stats/:email', async (req, res) => {
+  const email = req.params.email;
+
+  try {
+    const result = await paymentCollection.aggregate([
+      {
+        $match: { email: email } // Filter by the user's email
+      },
+      {
+        $unwind: '$foodItemIds'
+      },
+      {
+        $set: {
+          foodItemIds: {
+            $toObjectId: '$foodItemIds'
+          }
+        }
+      },
+      {
+        $lookup: {
+          from: 'foodsDatabase',
+          localField: 'foodItemIds',
+          foreignField: '_id',
+          as: 'foodItems'
+        }
+      },
+      {
+        $unwind: '$foodItems'
+      },
+      {
+        $set: {
+          'foodItems.price': {
+            $convert: {
+              input: '$foodItems.price',
+              to: 'int',
+              onError: 0,
+              onNull: 0
+            }
+          }
+        }
+      },
+      {
+        $group: {
+          _id: '$foodItems.category',
+          quantity: { $sum: 1 },
+          revenue: { $sum: '$foodItems.price' }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          category: '$_id',
+          quantity: '$quantity',
+          revenue: '$revenue'
+        }
+      }
+    ]).toArray();
+
+    res.send(result);
+  } catch (error) {
+    console.error('Error fetching order stats:', error);
+    res.status(500).send({ message: 'Error fetching order stats' });
+  }
+});
+
+  // Add review
+    app.post('/reviews', verifyToken, async (req, res) => {
+      const review = req.body;
+      const query = { email: review.email };
+      const existingReview = await reviewCollection.findOne(query);
+
+      if (existingReview) {
+        const result = await reviewCollection.updateOne(query, { $set: review });
+        res.send(result);
+      } else {
+        const result = await reviewCollection.insertOne(review);
+        res.send(result);
+      }
+    });
+
+    // Get reviews for Customer component
+    app.get('/reviews', async (req, res) => {
+      const result = await reviewCollection.find().toArray();
+      res.send(result);
+    });
+
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
     console.log("You successfully connected to MongoDB!");
